@@ -1,9 +1,7 @@
 from flask import Flask, request, jsonify
-import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import binascii
-import aiohttp
 import requests
 import json
 import like_pb2
@@ -15,6 +13,7 @@ from datetime import datetime, timedelta
 import pytz
 import urllib3
 import os
+import threading
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -26,7 +25,7 @@ VALID_API_KEYS = {
     "KHAN"
 }
 
-# 👑 ADMIN CONFIG (CHANGE KAR SAKTA HAI)
+# 👑 ADMIN CONFIG
 ADMIN_KEY = "KG_ADMIN_2026"
 OWNER_NAME = "@Kgbrotherm"
 CHANNEL_NAME = "@SGCodexs"
@@ -35,7 +34,7 @@ CHANNEL_NAME = "@SGCodexs"
 daily_limit = 30
 used_count = 0
 
-# 🔥 KEY SYSTEM (AUTO CALCULATE)
+# 🔥 KEY SYSTEM
 KEY_TOTAL_REQUESTS = 10
 KEY_REMAINING_REQUESTS = 10
 KEY_EXPIRY_DAYS = 365
@@ -98,7 +97,7 @@ def create_protobuf_message(user_id, region):
         app.logger.error(f"Error creating protobuf message: {e}")
         return None
 
-async def send_request(encrypted_uid, token, url, session):
+def send_request_sync(encrypted_uid, token, url):
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
@@ -112,45 +111,54 @@ async def send_request(encrypted_uid, token, url, session):
             "X-GA": "v1 1",
             "ReleaseVersion": "OB54"
         }
-        async with session.post(url, data=edata, headers=headers, ssl=False) as response:
-            return response.status
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
+        return response.status_code
     except Exception as e:
-        app.logger.error(f"Exception in send_request: {e}")
+        app.logger.error(f"Exception in send_request_sync: {e}")
         return None
 
-async def send_multiple_requests(uid, region, url):
+def send_multiple_requests_sync(uid, region, url):
     try:
         protobuf_message = create_protobuf_message(uid, region)
         if protobuf_message is None:
-            return None, 0, 0
+            return 0, 0
         encrypted_uid = encrypt_message(protobuf_message)
         if encrypted_uid is None:
-            return None, 0, 0
+            return 0, 0
         tokens = load_tokens(region)
         if tokens is None:
-            return None, 0, 0
+            return 0, 0
         
         successful = 0
         failed = 0
         
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for i in range(BATCH_SIZE):
-                token = tokens[i % len(tokens)]["token"]
-                tasks.append(send_request(encrypted_uid, token, url, session))
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for r in results:
-                if isinstance(r, int) and r == 200:
-                    successful += 1
-                else:
-                    failed += 1
+        # Use threading for parallel requests (Vercel compatible)
+        def send_with_thread(token, results, index):
+            status = send_request_sync(encrypted_uid, token, url)
+            results[index] = status
         
-        return results, successful, failed
+        threads = []
+        results = [None] * BATCH_SIZE
+        
+        for i in range(BATCH_SIZE):
+            token = tokens[i % len(tokens)]["token"]
+            thread = threading.Thread(target=send_with_thread, args=(token, results, i))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
+        for r in results:
+            if r == 200:
+                successful += 1
+            elif r is not None:
+                failed += 1
+        
+        return successful, failed
     except Exception as e:
-        app.logger.error(f"Exception in send_multiple_requests: {e}")
-        return None, 0, 0
+        app.logger.error(f"Exception in send_multiple_requests_sync: {e}")
+        return 0, 0
 
 def create_protobuf(uid):
     try:
@@ -204,164 +212,154 @@ def make_request(encrypt, region, token):
 def handle_requests():
     global used_count, KEY_REMAINING_REQUESTS, KEY_TOTAL_REQUESTS
 
-    if should_reset_daily():
-        used_count = 0
-        KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
-        app.logger.info("🔄 Daily limit & key remaining auto-reset at 4 AM IST")
-
-    api_key = request.args.get("key")
-    if api_key not in VALID_API_KEYS:
-        result = OrderedDict([
-            ("error", "Invalid or missing API key"),
-            ("status", 3),
-            ("owner", OWNER_NAME)
-        ])
-        return app.response_class(
-            response=json.dumps(result, separators=(',', ':')),
-            status=401,
-            mimetype='application/json'
-        )
-
-    uid = request.args.get("uid")
-    region = request.args.get("region", "").upper()
-    if not uid or not region:
-        return {"error": "UID and region are required", "owner": OWNER_NAME}, 400
-
     try:
-        def process_request():
-            global used_count, KEY_REMAINING_REQUESTS
+        if should_reset_daily():
+            used_count = 0
+            KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
 
-            if KEY_REMAINING_REQUESTS <= 0:
-                result = OrderedDict([
-                    ("error", "Key remaining requests exhausted! Reset at 4 AM IST"),
-                    ("KeyRemainingRequests", f"0/{KEY_TOTAL_REQUESTS}"),
-                    ("KeyExpiresAt", get_auto_expiry_date(KEY_EXPIRY_DAYS)),
-                    ("status", 3),
-                    ("owner", OWNER_NAME)
-                ])
-                return app.response_class(
-                    response=json.dumps(result, separators=(',', ':')),
-                    status=403,
-                    mimetype='application/json'
-                )
-
-            tokens = load_tokens(region)
-            if not tokens:
-                raise Exception("Failed to load tokens.")
-            token = tokens[0]['token']
-            encrypted_uid = enc(uid)
-            if encrypted_uid is None:
-                raise Exception("Encryption of UID failed.")
-            before = make_request(encrypted_uid, region, token)
-            if before is None:
-                raise Exception("Failed to get initial info.")
-            before_like = before.AccountInfo.Likes
-
-            if region == "IND":
-                url = "https://client.ind.freefiremobile.com/LikeProfile"
-            elif region in {"BR", "US", "SAC", "NA"}:
-                url = "https://client.us.freefiremobile.com/LikeProfile"
-            else:
-                url = "https://clientbp.ggpolarbear.com/LikeProfile"
-
-            results, successful, failed = asyncio.run(send_multiple_requests(uid, region, url))
-            
-            if results is None:
-                raise Exception("Failed to send like requests.")
-
-            after = make_request(encrypted_uid, region, token)
-            if after is None:
-                raise Exception("Failed to get final info.")
-            after_like = after.AccountInfo.Likes
-            like_given = after_like - before_like
-            status = 1 if like_given > 0 else 2
-
-            if status == 1:
-                used_count += 1
-                KEY_REMAINING_REQUESTS -= 1
-
-            remaining = max(daily_limit - used_count, 0)
-            auto_expiry = get_auto_expiry_date(KEY_EXPIRY_DAYS)
-
-            # 🔥 FINAL RESPONSE WITH OWNER
+        api_key = request.args.get("key")
+        if api_key not in VALID_API_KEYS:
             result = OrderedDict([
-                ("BatchSuccessCount", successful),
-                ("BatchFailedCount", failed),
-                ("BatchTotalAttempted", BATCH_SIZE),
-                ("LikesGivenByAPI", like_given),
-                ("LikesafterCommand", after_like),
-                ("LikesbeforeCommand", before_like),
-                ("PlayerNickname", after.AccountInfo.PlayerNickname),
-                ("Level", after.AccountInfo.Levels),
-                ("Region", after.AccountInfo.PlayerRegion),
-                ("UID", after.AccountInfo.UID),
-                ("status", status),
-                ("daily_limit", daily_limit),
-                ("used", used_count),
-                ("remaining", remaining),
-                ("KeyExpiresAt", auto_expiry),
-                ("KeyRemainingRequests", f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}"),
-                ("reset_info", "4:00 AM IST (Auto reset)"),
-                ("owner", OWNER_NAME),  # 🔥 Owner added
-                ("channel", CHANNEL_NAME)  # 🔥 Channel added
+                ("error", "Invalid or missing API key"),
+                ("status", 3),
+                ("owner", OWNER_NAME),
+                ("channel", CHANNEL_NAME)
             ])
+            return jsonify(result), 401
 
-            return app.response_class(
-                response=json.dumps(result, separators=(',', ':')),
-                status=200,
-                mimetype='application/json'
-            )
+        uid = request.args.get("uid")
+        region = request.args.get("region", "").upper()
+        if not uid or not region:
+            return jsonify({"error": "UID and region are required", "owner": OWNER_NAME}), 400
 
-        return process_request()
+        if KEY_REMAINING_REQUESTS <= 0:
+            result = OrderedDict([
+                ("error", "Key remaining requests exhausted! Reset at 4 AM IST"),
+                ("KeyRemainingRequests", f"0/{KEY_TOTAL_REQUESTS}"),
+                ("KeyExpiresAt", get_auto_expiry_date(KEY_EXPIRY_DAYS)),
+                ("status", 3),
+                ("owner", OWNER_NAME),
+                ("channel", CHANNEL_NAME)
+            ])
+            return jsonify(result), 403
+
+        tokens = load_tokens(region)
+        if not tokens:
+            return jsonify({"error": "Failed to load tokens.", "owner": OWNER_NAME}), 500
+        
+        token = tokens[0]['token']
+        encrypted_uid = enc(uid)
+        if encrypted_uid is None:
+            return jsonify({"error": "Encryption of UID failed.", "owner": OWNER_NAME}), 500
+        
+        before = make_request(encrypted_uid, region, token)
+        if before is None:
+            return jsonify({"error": "Failed to get initial info.", "owner": OWNER_NAME}), 500
+        
+        before_like = before.AccountInfo.Likes
+
+        if region == "IND":
+            url = "https://client.ind.freefiremobile.com/LikeProfile"
+        elif region in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/LikeProfile"
+        else:
+            url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+        successful, failed = send_multiple_requests_sync(uid, region, url)
+
+        after = make_request(encrypted_uid, region, token)
+        if after is None:
+            return jsonify({"error": "Failed to get final info.", "owner": OWNER_NAME}), 500
+        
+        after_like = after.AccountInfo.Likes
+        like_given = after_like - before_like
+        status = 1 if like_given > 0 else 2
+
+        if status == 1:
+            used_count += 1
+            KEY_REMAINING_REQUESTS -= 1
+
+        remaining = max(daily_limit - used_count, 0)
+        auto_expiry = get_auto_expiry_date(KEY_EXPIRY_DAYS)
+
+        result = OrderedDict([
+            ("BatchSuccessCount", successful),
+            ("BatchFailedCount", failed),
+            ("BatchTotalAttempted", BATCH_SIZE),
+            ("LikesGivenByAPI", like_given),
+            ("LikesafterCommand", after_like),
+            ("LikesbeforeCommand", before_like),
+            ("PlayerNickname", after.AccountInfo.PlayerNickname),
+            ("Level", after.AccountInfo.Levels),
+            ("Region", after.AccountInfo.PlayerRegion),
+            ("UID", after.AccountInfo.UID),
+            ("status", status),
+            ("daily_limit", daily_limit),
+            ("used", used_count),
+            ("remaining", remaining),
+            ("KeyExpiresAt", auto_expiry),
+            ("KeyRemainingRequests", f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}"),
+            ("reset_info", "4:00 AM IST (Auto reset)"),
+            ("owner", OWNER_NAME),
+            ("channel", CHANNEL_NAME)
+        ])
+
+        return jsonify(result)
 
     except Exception as e:
         app.logger.error(f"Error: {e}")
-        return {"error": str(e), "owner": OWNER_NAME}, 500
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/remain', methods=['GET'])
 def remain_info():
     global used_count, KEY_REMAINING_REQUESTS, KEY_TOTAL_REQUESTS
     
-    if should_reset_daily():
-        used_count = 0
-        KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
-    
-    remaining = max(daily_limit - used_count, 0)
-    auto_expiry = get_auto_expiry_date(KEY_EXPIRY_DAYS)
-    
-    data = {
-        "daily_limit": daily_limit,
-        "remaining": remaining,
-        "used": used_count,
-        "reset_info": "4:00 AM IST (Auto reset)",
-        "KeyExpiresAt": auto_expiry,
-        "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
-        "total_requests_allowed": KEY_TOTAL_REQUESTS,
-        "batch_size": BATCH_SIZE,
-        "owner": OWNER_NAME,
-        "channel": CHANNEL_NAME
-    }
-    return jsonify(data)
+    try:
+        if should_reset_daily():
+            used_count = 0
+            KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
+        
+        remaining = max(daily_limit - used_count, 0)
+        auto_expiry = get_auto_expiry_date(KEY_EXPIRY_DAYS)
+        
+        data = {
+            "daily_limit": daily_limit,
+            "remaining": remaining,
+            "used": used_count,
+            "reset_info": "4:00 AM IST (Auto reset)",
+            "KeyExpiresAt": auto_expiry,
+            "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
+            "total_requests_allowed": KEY_TOTAL_REQUESTS,
+            "batch_size": BATCH_SIZE,
+            "owner": OWNER_NAME,
+            "channel": CHANNEL_NAME
+        }
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/reset', methods=['GET'])
 def reset_all():
     global used_count, KEY_REMAINING_REQUESTS, KEY_TOTAL_REQUESTS
     
-    admin_key = request.args.get("admin_key")
-    if admin_key != ADMIN_KEY:
-        return jsonify({"error": "Invalid admin key", "owner": OWNER_NAME}), 401
-    
-    used_count = 0
-    KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
-    
-    return jsonify({
-        "message": "✅ All counters reset successfully!",
-        "used_count": used_count,
-        "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
-        "reset_time": get_ist_time().strftime("%Y-%m-%d %H:%M:%S IST"),
-        "owner": OWNER_NAME,
-        "channel": CHANNEL_NAME
-    })
+    try:
+        admin_key = request.args.get("admin_key")
+        if admin_key != ADMIN_KEY:
+            return jsonify({"error": "Invalid admin key", "owner": OWNER_NAME}), 401
+        
+        used_count = 0
+        KEY_REMAINING_REQUESTS = KEY_TOTAL_REQUESTS
+        
+        return jsonify({
+            "message": "✅ All counters reset successfully!",
+            "used_count": used_count,
+            "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
+            "reset_time": get_ist_time().strftime("%Y-%m-%d %H:%M:%S IST"),
+            "owner": OWNER_NAME,
+            "channel": CHANNEL_NAME
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/')
 def home():
@@ -384,89 +382,98 @@ def home():
 
 @app.route('/token_info', methods=['GET'])
 def token_info():
-    servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
-    info = {"owner": OWNER_NAME, "channel": CHANNEL_NAME}
-    
-    for server in servers:
-        regular_tokens = load_tokens(server)
-        info[server] = {
-            "regular_tokens": len(regular_tokens) if regular_tokens else 0,
-            "visit_tokens": "Not used anymore (same as regular tokens)"
-        }
-    
-    return jsonify(info)
+    try:
+        servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
+        info = {"owner": OWNER_NAME, "channel": CHANNEL_NAME}
+        
+        for server in servers:
+            regular_tokens = load_tokens(server)
+            info[server] = {
+                "regular_tokens": len(regular_tokens) if regular_tokens else 0,
+                "visit_tokens": "Not used anymore (same as regular tokens)"
+            }
+        
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/token_status', methods=['GET'])
 def token_status():
-    region = request.args.get("region", "").upper()
-    if not region:
-        return jsonify({"error": "Region parameter required", "owner": OWNER_NAME}), 400
-    
-    tokens = load_tokens(region)
-    if tokens is None:
-        return jsonify({"region": region, "total_tokens": 0, "status": "error", "owner": OWNER_NAME}), 404
-    
-    return jsonify({
-        "region": region,
-        "total_tokens": len(tokens),
-        "active_tokens": len(tokens),
-        "status": "healthy",
-        "owner": OWNER_NAME,
-        "channel": CHANNEL_NAME
-    })
+    try:
+        region = request.args.get("region", "").upper()
+        if not region:
+            return jsonify({"error": "Region parameter required", "owner": OWNER_NAME}), 400
+        
+        tokens = load_tokens(region)
+        if tokens is None:
+            return jsonify({"region": region, "total_tokens": 0, "status": "error", "owner": OWNER_NAME}), 404
+        
+        return jsonify({
+            "region": region,
+            "total_tokens": len(tokens),
+            "active_tokens": len(tokens),
+            "status": "healthy",
+            "owner": OWNER_NAME,
+            "channel": CHANNEL_NAME
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/set_key', methods=['GET'])
 def set_key():
     global KEY_EXPIRY_DAYS, KEY_TOTAL_REQUESTS, KEY_REMAINING_REQUESTS, used_count, BATCH_SIZE, ADMIN_KEY, OWNER_NAME, daily_limit, CHANNEL_NAME
     
-    admin_key = request.args.get("admin_key")
-    if admin_key != ADMIN_KEY:
-        return jsonify({"error": "Invalid admin key", "owner": OWNER_NAME}), 401
-    
-    new_expiry_days = request.args.get("expiry_days")
-    new_total = request.args.get("total_requests")
-    new_remaining = request.args.get("remaining")
-    new_batch_size = request.args.get("batch_size")
-    new_admin_key = request.args.get("new_admin_key")
-    new_owner = request.args.get("new_owner")
-    new_channel = request.args.get("new_channel")
-    new_daily_limit = request.args.get("daily_limit")
-    reset_used = request.args.get("reset_used", "false").lower() == "true"
-    
-    if new_expiry_days:
-        KEY_EXPIRY_DAYS = int(new_expiry_days)
-    if new_total:
-        KEY_TOTAL_REQUESTS = int(new_total)
-        KEY_REMAINING_REQUESTS = int(new_total)
-    if new_remaining:
-        KEY_REMAINING_REQUESTS = int(new_remaining)
-    if new_batch_size:
-        BATCH_SIZE = int(new_batch_size)
-    if new_admin_key:
-        ADMIN_KEY = new_admin_key
-    if new_owner:
-        OWNER_NAME = new_owner
-    if new_channel:
-        CHANNEL_NAME = new_channel
-    if new_daily_limit:
-        daily_limit = int(new_daily_limit)
-    if reset_used:
-        used_count = 0
-    
-    return jsonify({
-        "message": "✅ All settings updated successfully!",
-        "owner": OWNER_NAME,
-        "channel": CHANNEL_NAME,
-        "admin_key": ADMIN_KEY,
-        "KeyExpiresAt": get_auto_expiry_date(KEY_EXPIRY_DAYS),
-        "KeyExpiryDays": KEY_EXPIRY_DAYS,
-        "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
-        "BatchSize": BATCH_SIZE,
-        "daily_limit": daily_limit,
-        "used_count": used_count
-    })
+    try:
+        admin_key = request.args.get("admin_key")
+        if admin_key != ADMIN_KEY:
+            return jsonify({"error": "Invalid admin key", "owner": OWNER_NAME}), 401
+        
+        new_expiry_days = request.args.get("expiry_days")
+        new_total = request.args.get("total_requests")
+        new_remaining = request.args.get("remaining")
+        new_batch_size = request.args.get("batch_size")
+        new_admin_key = request.args.get("new_admin_key")
+        new_owner = request.args.get("new_owner")
+        new_channel = request.args.get("new_channel")
+        new_daily_limit = request.args.get("daily_limit")
+        reset_used = request.args.get("reset_used", "false").lower() == "true"
+        
+        if new_expiry_days:
+            KEY_EXPIRY_DAYS = int(new_expiry_days)
+        if new_total:
+            KEY_TOTAL_REQUESTS = int(new_total)
+            KEY_REMAINING_REQUESTS = int(new_total)
+        if new_remaining:
+            KEY_REMAINING_REQUESTS = int(new_remaining)
+        if new_batch_size:
+            BATCH_SIZE = int(new_batch_size)
+        if new_admin_key:
+            ADMIN_KEY = new_admin_key
+        if new_owner:
+            OWNER_NAME = new_owner
+        if new_channel:
+            CHANNEL_NAME = new_channel
+        if new_daily_limit:
+            daily_limit = int(new_daily_limit)
+        if reset_used:
+            used_count = 0
+        
+        return jsonify({
+            "message": "✅ All settings updated successfully!",
+            "owner": OWNER_NAME,
+            "channel": CHANNEL_NAME,
+            "admin_key": ADMIN_KEY,
+            "KeyExpiresAt": get_auto_expiry_date(KEY_EXPIRY_DAYS),
+            "KeyExpiryDays": KEY_EXPIRY_DAYS,
+            "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
+            "BatchSize": BATCH_SIZE,
+            "daily_limit": daily_limit,
+            "used_count": used_count
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
-# Vercel serverless entry point
+# For Vercel serverless
 def handler(request, *args, **kwargs):
     return app(request, *args, **kwargs)
 
