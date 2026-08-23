@@ -40,7 +40,7 @@ RESET_HOUR = 4
 RESET_MINUTE = 0
 
 # 📊 Batch tracking
-BATCH_SIZE = 100
+BATCH_SIZE = 150
 
 def get_auto_expiry_date(days=365):
     now = datetime.now(pytz.UTC)
