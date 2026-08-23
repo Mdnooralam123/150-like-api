@@ -12,7 +12,6 @@ from collections import OrderedDict
 from datetime import datetime, timedelta
 import pytz
 import urllib3
-import os
 import threading
 
 # Disable SSL warnings
@@ -28,7 +27,6 @@ VALID_API_KEYS = {
 # 👑 ADMIN CONFIG
 ADMIN_KEY = "KG_ADMIN_2026"
 OWNER_NAME = "@Kgbrotherm"
-CHANNEL_NAME = "@SGCodexs"
 
 # 🔢 Like limit tracking
 daily_limit = 30
@@ -132,7 +130,6 @@ def send_multiple_requests_sync(uid, region, url):
         successful = 0
         failed = 0
         
-        # Use threading for parallel requests (Vercel compatible)
         def send_with_thread(token, results, index):
             status = send_request_sync(encrypted_uid, token, url)
             results[index] = status
@@ -222,8 +219,7 @@ def handle_requests():
             result = OrderedDict([
                 ("error", "Invalid or missing API key"),
                 ("status", 3),
-                ("owner", OWNER_NAME),
-                ("channel", CHANNEL_NAME)
+                ("owner", OWNER_NAME)
             ])
             return jsonify(result), 401
 
@@ -238,8 +234,7 @@ def handle_requests():
                 ("KeyRemainingRequests", f"0/{KEY_TOTAL_REQUESTS}"),
                 ("KeyExpiresAt", get_auto_expiry_date(KEY_EXPIRY_DAYS)),
                 ("status", 3),
-                ("owner", OWNER_NAME),
-                ("channel", CHANNEL_NAME)
+                ("owner", OWNER_NAME)
             ])
             return jsonify(result), 403
 
@@ -300,8 +295,7 @@ def handle_requests():
             ("KeyExpiresAt", auto_expiry),
             ("KeyRemainingRequests", f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}"),
             ("reset_info", "4:00 AM IST (Auto reset)"),
-            ("owner", OWNER_NAME),
-            ("channel", CHANNEL_NAME)
+            ("owner", OWNER_NAME)
         ])
 
         return jsonify(result)
@@ -331,8 +325,7 @@ def remain_info():
             "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
             "total_requests_allowed": KEY_TOTAL_REQUESTS,
             "batch_size": BATCH_SIZE,
-            "owner": OWNER_NAME,
-            "channel": CHANNEL_NAME
+            "owner": OWNER_NAME
         }
         return jsonify(data)
     except Exception as e:
@@ -355,8 +348,7 @@ def reset_all():
             "used_count": used_count,
             "KeyRemainingRequests": f"{KEY_REMAINING_REQUESTS}/{KEY_TOTAL_REQUESTS}",
             "reset_time": get_ist_time().strftime("%Y-%m-%d %H:%M:%S IST"),
-            "owner": OWNER_NAME,
-            "channel": CHANNEL_NAME
+            "owner": OWNER_NAME
         })
     except Exception as e:
         return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
@@ -367,7 +359,6 @@ def home():
         "status": "running",
         "message": "🔥 DEVILS WILL RISE — Subscriber Edition",
         "owner": OWNER_NAME,
-        "channel": CHANNEL_NAME,
         "version": "2.0",
         "batch_size": BATCH_SIZE,
         "endpoints": {
@@ -384,7 +375,7 @@ def home():
 def token_info():
     try:
         servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
-        info = {"owner": OWNER_NAME, "channel": CHANNEL_NAME}
+        info = {"owner": OWNER_NAME}
         
         for server in servers:
             regular_tokens = load_tokens(server)
@@ -413,15 +404,14 @@ def token_status():
             "total_tokens": len(tokens),
             "active_tokens": len(tokens),
             "status": "healthy",
-            "owner": OWNER_NAME,
-            "channel": CHANNEL_NAME
+            "owner": OWNER_NAME
         })
     except Exception as e:
         return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
 
 @app.route('/set_key', methods=['GET'])
 def set_key():
-    global KEY_EXPIRY_DAYS, KEY_TOTAL_REQUESTS, KEY_REMAINING_REQUESTS, used_count, BATCH_SIZE, ADMIN_KEY, OWNER_NAME, daily_limit, CHANNEL_NAME
+    global KEY_EXPIRY_DAYS, KEY_TOTAL_REQUESTS, KEY_REMAINING_REQUESTS, used_count, BATCH_SIZE, ADMIN_KEY, OWNER_NAME, daily_limit
     
     try:
         admin_key = request.args.get("admin_key")
@@ -434,7 +424,6 @@ def set_key():
         new_batch_size = request.args.get("batch_size")
         new_admin_key = request.args.get("new_admin_key")
         new_owner = request.args.get("new_owner")
-        new_channel = request.args.get("new_channel")
         new_daily_limit = request.args.get("daily_limit")
         reset_used = request.args.get("reset_used", "false").lower() == "true"
         
@@ -451,8 +440,6 @@ def set_key():
             ADMIN_KEY = new_admin_key
         if new_owner:
             OWNER_NAME = new_owner
-        if new_channel:
-            CHANNEL_NAME = new_channel
         if new_daily_limit:
             daily_limit = int(new_daily_limit)
         if reset_used:
@@ -461,7 +448,6 @@ def set_key():
         return jsonify({
             "message": "✅ All settings updated successfully!",
             "owner": OWNER_NAME,
-            "channel": CHANNEL_NAME,
             "admin_key": ADMIN_KEY,
             "KeyExpiresAt": get_auto_expiry_date(KEY_EXPIRY_DAYS),
             "KeyExpiryDays": KEY_EXPIRY_DAYS,
@@ -472,10 +458,6 @@ def set_key():
         })
     except Exception as e:
         return jsonify({"error": str(e), "owner": OWNER_NAME}), 500
-
-# For Vercel serverless
-def handler(request, *args, **kwargs):
-    return app(request, *args, **kwargs)
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5000)
